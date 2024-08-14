@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebAssembly Face Detection</title>
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            background-color: #222;
+            color: white;
+            font-family: Arial, sans-serif;
+        }
+
+        #controls {
+            margin-bottom: 10px;
+        }
+
+        #fps {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background-color: black;
+            padding: 5px;
+            font-family: Arial, sans-serif;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="controls">
+        <button id="toggleWebcam">Start Webcam</button>
+    </div>
+    <video id="video" width="640" height="480" autoplay style="display: none;"></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="fps">FPS: 0</div>
+
+    <!-- Include the generated JavaScript glue code -->
+    <script src="facedetection.js"></script>
+    <script>
+
+        Module.onRuntimeInitialized = async () => {
+            console.log("WASM Module initialized");
+            const { _facedetect_cnn } = Module;
+
+            const videoElement = document.getElementById('video');
+            const canvas = document.getElementById('canvas');
+            const ctx = canvas.getContext('2d');
+            const fpsDisplay = document.getElementById('fps');
+            const toggleButton = document.getElementById('toggleWebcam');
+            let stream = null;
+            let animationFrameId = null;
+
+            const resultBufferSize = 0x20000; // 128 KB
+            const dataLength = 1228800;
+            const resultBuffer = Module._malloc(resultBufferSize);
+            const imageBuffer = Module._malloc(dataLength);
+
+            toggleButton.addEventListener('click', async () => {
+                if (stream) {
+                    stopWebcam();
+                } else {
+                    await startWebcam();
+                }
+            });
+
+            async function startWebcam() {
+                try {
+                    toggleButton.innerHTML = "Stop Webcam";
+                    const devices = await navigator.mediaDevices.enumerateDevices();
+                    let videoDeviceId = devices.find(device => device.kind === 'videoinput' && device.label.toLowerCase().includes('back'))?.deviceId;
+
+                    if (!videoDeviceId) {
+                        videoDeviceId = devices.find(device => device.kind === 'videoinput')?.deviceId;
+                    }
+
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            deviceId: videoDeviceId ? { exact: videoDeviceId } : undefined,
+                            width: { ideal: 640 },
+                            height: { ideal: 480 }
+                        }
+                    });
+
+                    videoElement.srcObject = stream;
+
+                    videoElement.addEventListener('play', () => {
+                        let lastTime = performance.now();
+                        let frameCount = 0;
+
+                        const stepFunc = () => {
+                            if (videoElement.paused || videoElement.ended) {
+                                return;
+                            }
+                            ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+                            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                            const { data, width, height } = imageData;
+                            const rgbData = new Uint8ClampedArray((data.length / 4) * 3);
+
+                            for (let i = 0, j = 0; i < data.length; i += 4, j += 3) {
+                                rgbData[j] = data[i];
+                                rgbData[j + 1] = data[i + 1];
+                                rgbData[j + 2] = data[i + 2];
+                            }
+
+                            const step = width * 3;
+
+                            if (!resultBuffer || !imageBuffer) {
+                                throw new Error("Memory allocation failed");
+                            }
+
+                            Module.HEAPU8.set(new Uint8Array(rgbData), imageBuffer);
+                            const resultPtr = _facedetect_cnn(resultBuffer, imageBuffer, width, height, step);
+
+                            const results = [];
+                            const resultArray = new Int16Array(Module.HEAP16.buffer, resultBuffer, resultBufferSize / 2);
+                            const length = (resultArray[1] << 16) | (resultArray[0] & 0xFFFF);
+                            for (let i = 2; i < length * 16 + 2; i += 16) {
+                                const confidence = resultArray[i];
+                                const x = resultArray[i + 1];
+                                const y = resultArray[i + 2];
+                                const w = resultArray[i + 3];
+                                const h = resultArray[i + 4];
+                                const landmarks = [];
+                                for (let lmidx = 0; lmidx < 10; lmidx++) {
+                                    landmarks.push(resultArray[i + 5 + lmidx]);
+                                }
+
+                                if (confidence > 0) {
+                                    results.push({ confidence, x, y, w, h, landmarks });
+                                }
+                            }
+
+                            results.forEach(result => {
+                                const { confidence, x, y, w, h, landmarks } = result;
+                                ctx.strokeStyle = 'red';
+                                ctx.lineWidth = 2;
+                                ctx.strokeRect(x, y, w, h);
+                                ctx.font = '12px Arial';
+                                ctx.fillStyle = 'red';
+                                ctx.fillText(`Conf: ${confidence.toFixed(2)}`, x, y - 10);
+                                const colors = ['blue', 'red', 'green', 'magenta', 'cyan'];
+                                for (let j = 0; j < 5; j++) {
+                                    const lmX = landmarks[2 * j];
+                                    const lmY = landmarks[2 * j + 1];
+                                    ctx.fillStyle = colors[j];
+                                    ctx.beginPath();
+                                    ctx.arc(lmX, lmY, 2, 0, 2 * Math.PI);
+                                    ctx.fill();
+                                }
+                            });
+
+                            frameCount++;
+                            const now = performance.now();
+                            const elapsed = now - lastTime;
+                            if (elapsed >= 1000) {
+                                const fps = frameCount / (elapsed / 1000);
+                                fpsDisplay.textContent = `FPS: ${fps.toFixed(2)}`;
+                                frameCount = 0;
+                                lastTime = now;
+                            }
+
+                            animationFrameId = requestAnimationFrame(stepFunc);
+                        }
+
+                        animationFrameId = requestAnimationFrame(stepFunc);
+                    });
+
+                } catch (error) {
+                    console.error('Error accessing webcam:', error);
+                }
+            }
+
+            function stopWebcam() {
+                if (stream) {
+                    toggleButton.innerHTML = "Start Webcam";
+                    stream.getTracks().forEach(track => track.stop());
+                    stream = null;
+                    videoElement.srcObject = null;
+                    if (animationFrameId) {
+                        cancelAnimationFrame(animationFrameId);
+                        animationFrameId = null;
+                    }
+                }
+            }
+        };
+    </script>
+</body>
+
+</html>
